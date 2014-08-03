@@ -5,6 +5,7 @@ from flask.views import MethodView
 
 from wordpress_xmlrpc import Client
 from wordpress_xmlrpc import methods as wp_methods
+from wordpress_xmlrpc.methods import taxonomies as wp_taxonomies
 
 
 app = Flask(__name__)
@@ -12,6 +13,8 @@ wp = Client('http://localhost/wptrunk/src/xmlrpc.php', 'maxcutler', 'maxcutler')
 
 blog_time_zone = wp.call(wp_methods.options.GetOptions(['time_zone']))[0].value
 tz_delta = timedelta(seconds = int(blog_time_zone) * 3600)
+
+default_page_size = 10
 
 def route_to_abs(route):
     return request.url_root + route[1:]
@@ -42,18 +45,17 @@ def api_route():
         endpoint_params = {}
         if (name != 'post'):
             endpoint_params['post_type'] = name
-        endpoint = route_to_abs(helpers.url_for('posts', **endpoint_params))
+        endpoint = route_to_abs(helpers.url_for(PostCollectionApi.name, **endpoint_params))
 
         resources[name] = {
             'versions': {
-                '1': endpoint,
+                'v1': endpoint,
                 'latest': endpoint
             },
             'supports': ['GET', 'POST', 'DELETE'],
         }
 
     extra_resources = [
-        (CommentApi.name, CommentCollectionApi.name),
         (UserApi.name, UserCollectionApi.name),
         (FileApi.name, FileCollectionApi.name),
         (ImageApi.name, ImageCollectionApi.name),
@@ -66,7 +68,7 @@ def api_route():
         endpoint = route_to_abs(helpers.url_for(plural))
         resources[singular] = {
             'versions': {
-                '1': endpoint,
+                'v1': endpoint,
                 'latest': endpoint
             },
             'supports': ['GET', 'POST', 'DELETE']
@@ -79,9 +81,28 @@ def api_route():
 
 class PostApi(MethodView):
     name = 'post'
+    media_type = 'application/vnd.wordpress.post.v1'
+
+    @staticmethod
+    def from_xmlrpc_custom_field(field):
+        return {
+            'id': field['id'],
+            'key': field['key'],
+            'value': field['value'],
+            '_meta': {
+                'links': {
+                    'self': '',
+                },
+                'supports': ['GET', 'PUT', 'DELETE']
+            }
+        }
 
     @staticmethod
     def from_xmlrpc(obj):
+        author = None
+        if (obj.user):
+            author = UserApi.from_xmlrpc(wp.call(wp_methods.users.GetUser(obj.user)))
+
         return {
             'id': obj.id,
             'title': obj.title,
@@ -99,17 +120,27 @@ class PostApi(MethodView):
             'content': {
                 'raw': obj.content
             },
+            'author': author,
             'comment_status': obj.comment_status,
             'ping_status': obj.ping_status,
             'sticky': obj.sticky,
             'date_gmt': obj.date.isoformat(),
             'modified_gmt': obj.date_modified.isoformat(),
             'terms': map(TaxonomyTermApi.from_xmlrpc, obj.terms),
-            'metadata': obj.custom_fields
+            'metadata': map(PostApi.from_xmlrpc_custom_field, obj.custom_fields),
+            '_meta': {
+                'links': {
+                    'self': route_to_abs(helpers.url_for(PostApi.name, id=obj.id)),
+                    'comments': route_to_abs(helpers.url_for(CommentCollectionApi.name, parent_id=obj.id))
+                },
+                'supports': ['GET', 'PUT', 'DELETE'],
+                'media_type': PostApi.media_type
+            }
         }
 
-    def get(self):
-        return 'get_post'
+    def get(self, id):
+        post = wp.call(wp_methods.posts.GetPost(id))
+        return json.jsonify(PostApi.from_xmlrpc(post))
 
 
 class PostCollectionApi(MethodView):
@@ -120,8 +151,8 @@ class PostCollectionApi(MethodView):
         post_type = request.values.get('post_type', 'post')
 
         posts = wp.call(wp_methods.posts.GetPosts({
-            'number': 20,
-            'offset': (page - 1) * 20,
+            'number': default_page_size,
+            'offset': (page - 1) * default_page_size,
             'post_type': post_type
         }))
 
@@ -132,19 +163,22 @@ class PostCollectionApi(MethodView):
             'supports': ['GET', 'POST']
         }
 
+        links = {}
+
         paging_params = {}
         if (post_type != 'post'):
             paging_params['post_type'] = post_type
 
-        if len(posts) == 20:
-            meta['next'] = route_to_abs(helpers.url_for('posts', page=page+1, **paging_params))
+        if len(posts) == default_page_size:
+            links['next'] = route_to_abs(helpers.url_for(PostCollectionApi.name, page=page+1, **paging_params))
 
         if page > 1:
             params = {}
             if (page > 2):
                 params['page'] = page + 1
-            meta['prev'] = route_to_abs(helpers.url_for('posts', **dict(paging_params, **params)))
+            links['prev'] = route_to_abs(helpers.url_for(PostCollectionApi.name, **dict(paging_params, **params)))
 
+        meta['links'] = links
         response['_meta'] = meta
 
         return json.jsonify(response)
@@ -152,26 +186,103 @@ class PostCollectionApi(MethodView):
 
 class CommentApi(MethodView):
     name = 'comment'
-    def get(self):
-        return 'get_comment'
+    media_type = 'application/vnd.wordpress.comment.v1'
+
+    @staticmethod
+    def from_xmlrpc(obj):
+        return {
+            '_meta': {
+                'media_type': CommentApi.media_type,
+                'supports': ['GET', 'PUT', 'DELETE'],
+                'links': {
+                    'self': route_to_abs(helpers.url_for(CommentApi.name, parent_id=obj.post, id=obj.id))
+                }
+            },
+            'id': obj.id,
+            'date': obj.date_created.isoformat(),
+            'status': obj.status,
+            'content': obj.content,
+            'link': obj.link,
+            'author': obj.author,
+            'author_url': obj.author_url,
+            'author_email': obj.author_email,
+            'author_ip': obj.author_ip
+        }
+
+    def get(self, parent_id, id):
+        comment = wp.call(wp_methods.comments.GetComment(id))
+        return json.jsonify(CommentApi.from_xmlrpc(comment))
 
 
 class CommentCollectionApi(MethodView):
     name = 'comments'
-    def get(self):
-        return 'get_comments'
+
+    def get(self, parent_id):
+        response = {}
+
+        page = int(request.values.get('page', 1))
+        comments = wp.call(wp_methods.comments.GetComments({
+            'post_id': parent_id,
+            'number': default_page_size,
+            'offset': (page - 1) * default_page_size
+        }))
+
+        response['items'] = map(CommentApi.from_xmlrpc, comments)
+        response['_meta'] = {
+            'supports': ['GET', 'POST'],
+            'links': {
+                'self': route_to_abs(helpers.url_for(CommentCollectionApi.name, parent_id=parent_id)),
+                'parent': route_to_abs(helpers.url_for(PostApi.name, id=parent_id))
+            }
+        }
+
+        return json.jsonify(response)
 
 
 class UserApi(MethodView):
     name = 'user'
-    def get(self):
-        return 'get_user'
+    media_type = 'application/vnd.wordpress.user.v1'
+
+    @staticmethod
+    def from_xmlrpc(obj):
+        return {
+            '_meta': {
+                'media_type': UserApi.media_type,
+                'supports': ['GET'],
+                'links': {
+                    'self': route_to_abs(helpers.url_for(UserApi.name, id=obj.id))
+                }
+            },
+            'id': obj.id,
+            'username': obj.username,
+            'nickname': obj.nickname,
+            'description': obj.bio,
+            'email': obj.email,
+            'url': obj.url
+        }
+
+    def get(self, id):
+        user = wp.call(wp_methods.users.GetUser(id))
+        return json.jsonify(UserApi.from_xmlrpc(user))
 
 
 class UserCollectionApi(MethodView):
     name = 'users'
+
     def get(self):
-        return 'get_users'
+        page = int(request.values.get('page', 1))
+        users = wp.call(wp_methods.users.GetUsers({
+            'number': default_page_size,
+            'offset': (page - 1) * default_page_size
+        }))
+
+        response = {}
+        response['items'] = map(UserApi.from_xmlrpc, users)
+        response['_meta'] = {
+            'supports': ['GET']
+        }
+
+        return json.jsonify(response)
 
 
 class FileApi(MethodView):
@@ -224,18 +335,51 @@ class AudioCollectionApi(MethodView):
 
 class TaxonomyApi(MethodView):
     name = 'taxonomy'
-    def get(self):
-        return 'get_taxonomy'
+    media_type = 'application/vnd.wordpress.taxonomy.v1'
+
+    @staticmethod
+    def from_xmlrpc(obj):
+        return {
+            'name': obj.name,
+            'label': obj.label,
+            'hierarchical': obj.hierarchical,
+            'public': obj.public,
+            'show_ui': obj.show_ui,
+            'is_builtin': obj.is_builtin,
+            'object_types': obj.object_type,
+            '_meta': {
+                'supports': ['GET'],
+                'media_type': TaxonomyApi.media_type,
+                'links': {
+                    'self': route_to_abs(helpers.url_for(TaxonomyApi.name, id=obj.name)),
+                    'terms': route_to_abs(helpers.url_for(TaxonomyTermCollectionApi.name, parent_id=obj.name))
+                }
+            }
+        }
+
+    def get(self, id):
+        taxonomy = wp.call(wp_taxonomies.GetTaxonomy(id))
+        return json.jsonify(TaxonomyApi.from_xmlrpc(taxonomy))
 
 
 class TaxonomyCollectionApi(MethodView):
     name = 'taxonomies'
+
     def get(self):
-        return 'get_taxonomies'
+        taxonomies = wp.call(wp_taxonomies.GetTaxonomies())
+
+        response = {}
+        response['items'] = map(TaxonomyApi.from_xmlrpc, taxonomies)
+        response['_meta'] = {
+            'supports': ['GET']
+        }
+
+        return json.jsonify(response)
 
 
 class TaxonomyTermApi(MethodView):
     name = 'term'
+    media_type = 'application/vnd.wordpress.taxonomyterm.v1'
 
     @staticmethod
     def from_xmlrpc(obj):
@@ -246,11 +390,18 @@ class TaxonomyTermApi(MethodView):
             'description': obj.description,
             'count': obj.count,
             'taxonomy': {
-                'self': route_to_abs(helpers.url_for(TaxonomyApi.name, id=obj.taxonomy)),
+                '_meta': {
+                    'links': {
+                        'self': route_to_abs(helpers.url_for(TaxonomyApi.name, id=obj.taxonomy)),
+                    },
+                    'media_type': TaxonomyApi.media_type,
+                    'supports': ['GET']
+                },
                 'name': obj.taxonomy
             },
             '_meta': {
                 'supports': ['GET', 'PUT', 'DELETE'],
+                'media_type': TaxonomyTermApi.media_type,
                 'links': {
                     'self': route_to_abs(helpers.url_for(TaxonomyTermApi.name, parent_id=obj.taxonomy, id=obj.id))
                 }
@@ -265,32 +416,46 @@ class TaxonomyTermApi(MethodView):
 
         return term
 
-    def get(self, taxonomy):
-        return 'get_term'
+    def get(self, parent_id, id):
+        term = wp.call(wp_taxonomies.GetTerm(parent_id, id))
+        return json.jsonify(TaxonomyTermApi.from_xmlrpc(term))
 
 
 class TaxonomyTermCollectionApi(MethodView):
     name = 'terms'
 
-    def get(self, taxonomy):
-        return 'get_terms'
+    def get(self, parent_id):
+        page = int(request.values.get('page', 1))
+
+        terms = wp.call(wp_taxonomies.GetTerms(parent_id, {
+            'number': default_page_size,
+            'offset': (page - 1) * default_page_size
+        }))
+
+        response = {}
+        response['items'] = map(TaxonomyTermApi.from_xmlrpc, terms)
+        response['_meta'] = {
+            'supports': ['GET', 'POST']
+        }
+
+        return json.jsonify(response)
 
 
 def register_collection(collection, item):
-    collection_pattern = '/wporg/1/' + collection.name + '/'
+    collection_pattern = '/wporg/v1/' + collection.name + '/'
     app.add_url_rule(collection_pattern, view_func=collection.as_view(collection.name))
     app.add_url_rule(collection_pattern + '<id>/', view_func=item.as_view(item.name))
 
 
 def register_nested_collection(parent, collection, item):
-    parent_path = '/wporg/1/' + parent.name + '/' + '<parent_id>/'
+    parent_path = '/wporg/v1/' + parent.name + '/' + '<parent_id>/'
     collection_path = parent_path + collection.name + '/'
     app.add_url_rule(collection_path, view_func=collection.as_view(collection.name))
     app.add_url_rule(collection_path + '<id>/', view_func=item.as_view(item.name))
 
 
 register_collection(PostCollectionApi, PostApi)
-register_collection(CommentCollectionApi, CommentApi)
+register_nested_collection(PostCollectionApi, CommentCollectionApi, CommentApi)
 register_collection(UserCollectionApi, UserApi)
 register_collection(FileCollectionApi, FileApi)
 register_collection(ImageCollectionApi, ImageApi)
